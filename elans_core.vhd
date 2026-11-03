@@ -57,9 +57,10 @@ architecture rtl of elans_core is
     signal pass_q : pass_type;
     signal pc_q : std_logic_vector(31 downto 0);
     signal previous_pc_q : std_logic_vector(31 downto 0);
-    signal next_pc_q : std_logic_vector(31 downto 0);
     signal instruction_q : std_logic_vector(31 downto 0);
     signal a_q : std_logic_vector(31 downto 0);
+    -- Shared lifetime: rs2/store payload during execution, then the link
+    -- or next-PC word after the operand and any AXI write are finished.
     signal b_q : std_logic_vector(31 downto 0);
     signal result_q : std_logic_vector(31 downto 0);
     signal bit_q : unsigned(4 downto 0);
@@ -172,8 +173,6 @@ architecture rtl of elans_core is
     signal result_shift : std_logic;
     signal result_in : std_logic;
     signal result_clear_lsb : std_logic;
-    signal next_pc_shift : std_logic;
-    signal next_pc_in : std_logic;
     signal shift_padding : std_logic;
 begin
     opcode <= instruction_q(6 downto 0);
@@ -239,7 +238,7 @@ begin
         (pass_q = execute_value and is_auipc = '1') else '0';
     alu_use_register_b <= '1' when pass_q = branch_compare or
         (pass_q = execute_value and is_register = '1') else '0';
-    alu_a_bit <= next_pc_q(0) when pass_q = increment_pc else a_q(0);
+    alu_a_bit <= b_q(0) when pass_q = increment_pc else a_q(0);
     alu_b_bit <= '1' when pass_q = increment_pc and bit_q = 2 else
                  '0' when pass_q = increment_pc else
                  b_q(0) when alu_use_register_b = '1' else result_q(0);
@@ -271,7 +270,7 @@ begin
     rf_index <= debug_index_i when state_q = halted else
         instruction_q(19 downto 15) when state_q = read_a_request else
         instruction_q(24 downto 20) when state_q = read_b_request else instruction_q(11 downto 7);
-    rf_input <= next_pc_q(0) when is_jump = '1' else result_q(0);
+    rf_input <= b_q(0) when is_jump = '1' else result_q(0);
     rf_write_valid <= '1' when state_q = write_wait and fault_i = '0' else '0';
     rf_cancel <= '1' when fault_i = '1' and state_q /= halted else '0';
     bus_request <= '1' when fault_i = '0' and ((state_q = fetch_request and pc_q(1 downto 0) = "00") or state_q = memory_request) else '0';
@@ -352,9 +351,14 @@ begin
             load_fill_q when state_q = shift_discard or state_q = shift_run else '0';
     b_shift <= '1' when
         (state_q = read_b_wait and rf_bit_valid = '1') or
-        (state_q = serial_run and pass_q /= increment_pc and alu_use_register_b = '1') or
-        (state_q = store_align and shift_q /= 0) else '0';
-    b_in <= rf_output when state_q = read_b_wait else b_q(0);
+        (state_q = pc_seed and pass_q = increment_pc) or
+        (state_q = serial_run and (pass_q = increment_pc or alu_use_register_b = '1')) or
+        (state_q = store_align and shift_q /= 0) or state_q = pc_transfer or
+        (state_q = write_wait and rf_bit_ready = '1' and is_jump = '1') else '0';
+    b_in <= rf_output when state_q = read_b_wait else
+            pc_serial_bit when state_q = pc_seed else
+            alu_result when state_q = serial_run and pass_q = increment_pc else
+            result_q(0) when state_q = pc_transfer else b_q(0);
     result_shift <= '1' when
         (state_q = serial_run and pass_q /= increment_pc) or
         state_q = immediate_seed or state_q = result_seed or
@@ -371,13 +375,6 @@ begin
     result_clear_lsb <= '1' when state_q = serial_finish and
         pass_q = control_target and is_jalr = '1' and
         target(1 downto 0) = "00" else '0';
-    next_pc_shift <= '1' when
-        (state_q = pc_seed and pass_q = increment_pc) or
-        (state_q = serial_run and pass_q = increment_pc) or state_q = pc_transfer or
-        (state_q = write_wait and rf_bit_ready = '1' and is_jump = '1') else '0';
-    next_pc_in <= pc_serial_bit when state_q = pc_seed else
-                  alu_result when state_q = serial_run else
-                  result_q(0) when state_q = pc_transfer else next_pc_q(0);
 
     datapath_pr: process (clock_i, async_reset_i) is
     begin
@@ -385,14 +382,12 @@ begin
             a_q <= (others => '0');
             b_q <= (others => '0');
             result_q <= (others => '0');
-            next_pc_q <= reset_pc;
         elsif rising_edge(clock_i) then
             if (sync_reset_i = sync_reset_active) and use_sync_reset then
                 a_q <= (others => '0');
                 b_q <= (others => '0');
                 result_q <= (others => '0');
-                next_pc_q <= reset_pc;
-            elsif datapath_active = '1' then
+                elsif datapath_active = '1' then
                 if a_load_bus = '1' then
                     a_q <= bus_output;
                 elsif a_shift = '1' then
@@ -405,9 +400,6 @@ begin
                     result_q <= result_in & result_q(31 downto 1);
                 elsif result_clear_lsb = '1' then
                     result_q(0) <= '0';
-                end if;
-                if next_pc_shift = '1' then
-                    next_pc_q <= next_pc_in & next_pc_q(31 downto 1);
                 end if;
             end if;
         end if;
@@ -502,8 +494,10 @@ begin
                         end if;
                     elsif state_q = read_b_wait then
                         if rf_done = '1' then
-                            pass_q <= increment_pc;
-                            state_q <= serial_clear;
+                            -- Keep rs2 live until execution is finished.
+                            -- PC+4 will reuse B only after its last use.
+                            pass_q <= execute_value;
+                            state_q <= dispatch;
                         end if;
                     elsif state_q = serial_clear then
                         bit_q <= (others => '0');
@@ -558,22 +552,31 @@ begin
                         end if;
                     elsif state_q = serial_finish then
                         if pass_q = increment_pc then
-                            state_q <= dispatch;
+                            if is_jump = '1' then
+                                -- B now holds PC+4 for the link write;
+                                -- result_q still holds the destination.
+                                state_q <= write_request;
+                            else
+                                state_q <= commit;
+                            end if;
                         elsif pass_q = branch_compare then
                             if branch_taken = '1' then
                                 pass_q <= control_target;
                                 state_q <= serial_clear;
                             else
-                                state_q <= commit;
+                                pass_q <= increment_pc;
+                                state_q <= serial_clear;
                             end if;
                         elsif pass_q = control_target then
                             if target(1 downto 0) /= "00" then
                                 fault_q <= '1';
                                 state_q <= halted;
                             elsif is_jump = '1' then
-                                -- Only JALR changes bit zero; all other bits
-                                -- already contain the destination.
-                                state_q <= write_request;
+                                -- The destination is complete (and JALR bit
+                                -- zero is cleared by the datapath). B is now
+                                -- free to compute the link before writeback.
+                                pass_q <= increment_pc;
+                                state_q <= serial_clear;
                             else
                                 bit_q <= (others => '0');
                                 state_q <= pc_transfer;
@@ -594,7 +597,8 @@ begin
                             bit_q <= (others => '0');
                             state_q <= result_seed;
                         elsif is_fence = '1' then
-                            state_q <= commit;
+                            pass_q <= increment_pc;
+                            state_q <= serial_clear;
                         elsif is_shift = '1' then
                             bit_q <= (others => '0');
                             if shift_arithmetic = '1' then
@@ -668,7 +672,10 @@ begin
                                 shift_q <= unsigned(std_logic_vector'(result_q(1 downto 0) & "000"));
                                 state_q <= load_align;
                             else
-                                state_q <= commit;
+                                -- Do not reuse the store payload until the
+                                -- AXI response handshake has completed.
+                                pass_q <= increment_pc;
+                                state_q <= serial_clear;
                             end if;
                         end if;
                     elsif state_q = load_align then
@@ -700,12 +707,13 @@ begin
                                 bit_q <= (others => '0');
                                 state_q <= pc_transfer;
                             else
-                                state_q <= commit;
+                                pass_q <= increment_pc;
+                                state_q <= serial_clear;
                             end if;
                         end if;
                     elsif state_q = pc_transfer then
-                        -- The link has already been written. Reuse the next-PC
-                        -- shifter for the branch/jump destination, then commit
+                        -- rs2 is dead, and any jump link has been written.
+                        -- Reuse B for the branch/jump destination, then commit
                         -- PC and its debug snapshot atomically.
                         if bit_q = 31 then
                             state_q <= commit;
@@ -714,7 +722,7 @@ begin
                         end if;
                     elsif state_q = commit then
                         previous_pc_q <= pc_q;
-                        pc_q <= next_pc_q;
+                        pc_q <= b_q;
                         state_q <= fetch_request;
                     elsif state_q = halted then
                         if debug_ready = '1' and debug_request_i = '1' then
