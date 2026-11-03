@@ -1,2 +1,2 @@
 # elan32_serial
-elan32 serial processor
+elan32 serial riscv processor
