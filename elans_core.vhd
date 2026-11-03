@@ -46,14 +46,10 @@ entity elans_core is
     );
 end entity;
 architecture rtl of elans_core is
-    subtype extension_11_type is std_logic_vector(10 downto 0);
-    subtype extension_19_type is std_logic_vector(18 downto 0);
-    subtype extension_20_type is std_logic_vector(19 downto 0);
-    subtype extension_31_type is std_logic_vector(30 downto 0);
-
     type state_type is (fetch_request, fetch_wait, decode, read_a_request,
         read_a_wait, read_b_request, read_b_wait, serial_clear, serial_run,
-        serial_finish, dispatch, shift_run, memory_prepare, memory_request,
+        serial_finish, immediate_seed, result_seed, dispatch, shift_discard,
+        shift_run, memory_prepare, memory_request,
         memory_wait, store_align, load_align, load_run, pc_transfer,
         write_request, write_wait, commit, halted);
     type pass_type is (increment_pc, execute_value, effective_address, branch_compare, control_target);
@@ -83,14 +79,13 @@ architecture rtl of elans_core is
     signal is_jump : std_logic;
     signal is_shift : std_logic;
     signal is_compare : std_logic;
-    signal immediate : std_logic_vector(31 downto 0);
+    signal immediate_bit : std_logic;
     signal alu_a_bit : std_logic;
     signal alu_b_bit : std_logic;
     signal alu_use_pc : std_logic;
     signal alu_use_register_b : std_logic;
     signal sign_a_q : std_logic;
     signal sign_b_q : std_logic;
-    signal align_q : unsigned(1 downto 0);
     signal load_fill_q : std_logic;
     signal load_bit : std_logic;
     signal alu_operation : std_logic_vector(2 downto 0);
@@ -125,6 +120,20 @@ architecture rtl of elans_core is
     signal bus_ready : std_logic;
     signal bus_done : std_logic;
     signal bus_error : std_logic;
+    signal datapath_active : std_logic;
+    signal a_shift : std_logic;
+    signal a_in : std_logic;
+    signal a_load_pc : std_logic;
+    signal a_load_bus : std_logic;
+    signal b_shift : std_logic;
+    signal b_in : std_logic;
+    signal result_shift : std_logic;
+    signal result_in : std_logic;
+    signal result_clear_lsb : std_logic;
+    signal next_pc_shift : std_logic;
+    signal next_pc_in : std_logic;
+    signal next_pc_load : std_logic;
+    signal shift_padding : std_logic;
 begin
     opcode <= instruction_q(6 downto 0);
     funct3 <= instruction_q(14 downto 12);
@@ -152,14 +161,51 @@ begin
         (opcode = "1100111" and funct3 = "000") or
         (opcode = "0001111" and funct3 = "000" and instruction_q(31 downto 28) = "0000")
         else '0';
-    -- Immediate wiring only: no immediate storage or arithmetic.
-    immediate <= instruction_q(31 downto 12) & x"000" when opcode = "0110111" or opcode = "0010111" else
-        extension_11_type'(others => instruction_q(31)) & instruction_q(31) & instruction_q(19 downto 12) & instruction_q(20) & instruction_q(30 downto 21) & '0' when opcode = "1101111" else
-        extension_19_type'(others => instruction_q(31)) & instruction_q(31) & instruction_q(7) & instruction_q(30 downto 25) & instruction_q(11 downto 8) & '0' when is_branch = '1' else
-        extension_20_type'(others => instruction_q(31)) & instruction_q(31 downto 25) & instruction_q(11 downto 7) when is_store = '1' else
-        extension_20_type'(others => instruction_q(31)) & instruction_q(31 downto 20);
-    -- The immediate and the accumulating result share the same shifter:
-    -- each consumed immediate bit is replaced at the top by one result bit.
+    -- Generate only the immediate bit being transferred. No parallel
+    -- immediate bus is connected to the result register's load mux.
+    immediate_pr: process (instruction_q, opcode, is_branch, is_store, bit_q) is
+        variable n : integer range 0 to 31;
+    begin
+        n := to_integer(bit_q);
+        immediate_bit <= instruction_q(31);
+        if opcode = "0110111" or opcode = "0010111" then
+            if n < 12 then
+                immediate_bit <= '0';
+            else
+                immediate_bit <= instruction_q(n);
+            end if;
+        elsif opcode = "1101111" then
+            if n = 0 then
+                immediate_bit <= '0';
+            elsif n < 11 then
+                immediate_bit <= instruction_q(n + 20);
+            elsif n = 11 then
+                immediate_bit <= instruction_q(20);
+            elsif n < 20 then
+                immediate_bit <= instruction_q(n);
+            end if;
+        elsif is_branch = '1' then
+            if n = 0 then
+                immediate_bit <= '0';
+            elsif n < 5 then
+                immediate_bit <= instruction_q(n + 7);
+            elsif n < 11 then
+                immediate_bit <= instruction_q(n + 20);
+            elsif n = 11 then
+                immediate_bit <= instruction_q(7);
+            end if;
+        elsif is_store = '1' then
+            if n < 5 then
+                immediate_bit <= instruction_q(n + 7);
+            elsif n < 12 then
+                immediate_bit <= instruction_q(n + 20);
+            end if;
+        elsif n < 12 then
+            immediate_bit <= instruction_q(n + 20);
+        end if;
+    end process;
+    -- Seed the result shifter with the immediate, then replace each
+    -- consumed bit with its corresponding ALU result over a second pass.
     alu_use_pc <= '1' when (pass_q = control_target and opcode /= "1100111") or
         (pass_q = execute_value and opcode = "0010111") else '0';
     alu_use_register_b <= '1' when pass_q = branch_compare or
@@ -212,8 +258,8 @@ begin
         "0001" when result_q(1 downto 0) = "00" else
         "0010" when result_q(1 downto 0) = "01" else
         "0100" when result_q(1 downto 0) = "10" else "1000";
-    -- Inactive store lanes are ignored by WSTRB. Rotate the source by
-    -- whole bytes before issuing AXI, instead of aligning a parallel bus.
+    -- Inactive store lanes are ignored by WSTRB. Rotate right by
+    -- (-8 * byte_offset) mod 32 single-bit steps before issuing AXI.
     bus_input <= b_q;
     load_bit <= a_q(0) when funct3 = "010" or bit_q < 8 or
         ((funct3 = "001" or funct3 = "101") and bit_q < 16) else load_fill_q;
@@ -259,6 +305,90 @@ begin
             rresp_i => rresp_i,
             rvalid_i => rvalid_i,
             rready_o => rready_o);
+    -- One shift enable and one serial input per temporary. All serial
+    -- operations share the same fixed right-shift wiring, including SLL.
+    datapath_active <= '0' when fault_i = '1' and state_q /= halted else '1';
+    shift_padding <= '1' when funct3 = "001" and shift_q /= 0 else '0';
+    a_load_pc <= '1' when state_q = serial_clear and
+        pass_q /= increment_pc and alu_use_pc = '1' else '0';
+    a_load_bus <= '1' when state_q = memory_wait and bus_done = '1' and
+        bus_error = '0' and is_load = '1' else '0';
+    a_shift <= '1' when
+        (state_q = read_a_wait and rf_bit_valid = '1') or
+        (state_q = halted and debug_wait_q = '1' and rf_bit_valid = '1') or
+        (state_q = serial_run and pass_q /= increment_pc) or
+        (state_q = load_align and shift_q /= 0) or state_q = load_run or
+        (state_q = shift_discard and funct3 /= "001" and shift_q /= 0) or
+        (state_q = shift_run and shift_padding = '0') else '0';
+    a_in <= rf_output when state_q = read_a_wait or state_q = halted else
+            a_q(0) when state_q = serial_run else
+            load_fill_q when state_q = shift_discard or state_q = shift_run else '0';
+    b_shift <= '1' when
+        (state_q = read_b_wait and rf_bit_valid = '1') or
+        (state_q = serial_run and pass_q /= increment_pc and alu_use_register_b = '1') or
+        (state_q = store_align and shift_q /= 0) else '0';
+    b_in <= rf_output when state_q = read_b_wait else b_q(0);
+    result_shift <= '1' when
+        (state_q = serial_run and pass_q /= increment_pc) or
+        state_q = immediate_seed or state_q = result_seed or
+        state_q = shift_run or state_q = load_run or state_q = pc_transfer or
+        (state_q = write_wait and rf_bit_ready = '1' and is_jump = '0') else '0';
+    result_in <= alu_result when state_q = serial_run else
+                 immediate_bit when state_q = immediate_seed or
+                     (state_q = result_seed and opcode = "0110111") else
+                 load_fill_q when state_q = result_seed and bit_q = 0 else
+                 '0' when state_q = result_seed else
+                 '0' when state_q = shift_run and shift_padding = '1' else
+                 a_q(0) when state_q = shift_run else
+                 load_bit when state_q = load_run else result_q(0);
+    result_clear_lsb <= '1' when state_q = serial_finish and
+        pass_q = control_target and opcode = "1100111" and
+        target(1 downto 0) = "00" else '0';
+    next_pc_load <= '1' when state_q = serial_clear and pass_q = increment_pc else '0';
+    next_pc_shift <= '1' when
+        (state_q = serial_run and pass_q = increment_pc) or state_q = pc_transfer or
+        (state_q = write_wait and rf_bit_ready = '1' and is_jump = '1') else '0';
+    next_pc_in <= alu_result when state_q = serial_run else
+                  result_q(0) when state_q = pc_transfer else next_pc_q(0);
+
+    datapath_pr: process (clock_i, async_reset_i) is
+    begin
+        if (async_reset_i = async_reset_active) and use_async_reset then
+            a_q <= (others => '0');
+            b_q <= (others => '0');
+            result_q <= (others => '0');
+            next_pc_q <= reset_pc;
+        elsif rising_edge(clock_i) then
+            if (sync_reset_i = sync_reset_active) and use_sync_reset then
+                a_q <= (others => '0');
+                b_q <= (others => '0');
+                result_q <= (others => '0');
+                next_pc_q <= reset_pc;
+            elsif datapath_active = '1' then
+                if a_load_pc = '1' then
+                    a_q <= pc_q;
+                elsif a_load_bus = '1' then
+                    a_q <= bus_output;
+                elsif a_shift = '1' then
+                    a_q <= a_in & a_q(31 downto 1);
+                end if;
+                if b_shift = '1' then
+                    b_q <= b_in & b_q(31 downto 1);
+                end if;
+                if result_shift = '1' then
+                    result_q <= result_in & result_q(31 downto 1);
+                elsif result_clear_lsb = '1' then
+                    result_q(0) <= '0';
+                end if;
+                if next_pc_load = '1' then
+                    next_pc_q <= pc_q;
+                elsif next_pc_shift = '1' then
+                    next_pc_q <= next_pc_in & next_pc_q(31 downto 1);
+                end if;
+            end if;
+        end if;
+    end process;
+
     controller_pr: process (clock_i, async_reset_i) is
     begin
         if (async_reset_i = async_reset_active) and use_async_reset then
@@ -266,18 +396,13 @@ begin
                 pass_q <= increment_pc;
                 pc_q <= reset_pc;
                 previous_pc_q <= reset_pc;
-                next_pc_q <= reset_pc;
                 instruction_q <= (others => '0');
-                a_q <= (others => '0');
-                b_q <= (others => '0');
-                result_q <= (others => '0');
                 bit_q <= (others => '0');
                 shift_q <= (others => '0');
                 fault_q <= '0';
                 debug_wait_q <= '0';
                 sign_a_q <= '0';
                 sign_b_q <= '0';
-                align_q <= (others => '0');
                 load_fill_q <= '0';
         elsif rising_edge(clock_i) then
             if (sync_reset_i = sync_reset_active) and use_sync_reset then
@@ -285,18 +410,13 @@ begin
                 pass_q <= increment_pc;
                 pc_q <= reset_pc;
                 previous_pc_q <= reset_pc;
-                next_pc_q <= reset_pc;
                 instruction_q <= (others => '0');
-                a_q <= (others => '0');
-                b_q <= (others => '0');
-                result_q <= (others => '0');
                 bit_q <= (others => '0');
                 shift_q <= (others => '0');
                 fault_q <= '0';
                 debug_wait_q <= '0';
                 sign_a_q <= '0';
                 sign_b_q <= '0';
-                align_q <= (others => '0');
                 load_fill_q <= '0';
             else
                 if fault_i = '1' and state_q /= halted then
@@ -332,9 +452,6 @@ begin
                             state_q <= read_a_wait;
                         end if;
                     elsif state_q = read_a_wait then
-                        if rf_bit_valid = '1' then
-                            a_q <= rf_output & a_q(31 downto 1);
-                        end if;
                         if rf_done = '1' then
                             state_q <= read_b_request;
                         end if;
@@ -343,20 +460,14 @@ begin
                             state_q <= read_b_wait;
                         end if;
                     elsif state_q = read_b_wait then
-                        if rf_bit_valid = '1' then
-                            b_q <= rf_output & b_q(31 downto 1);
-                        end if;
                         if rf_done = '1' then
                             pass_q <= increment_pc;
                             state_q <= serial_clear;
                         end if;
                     elsif state_q = serial_clear then
                         bit_q <= (others => '0');
-                        if pass_q = increment_pc then
-                            next_pc_q <= pc_q;
-                        else
+                        if pass_q /= increment_pc then
                             if alu_use_pc = '1' then
-                                a_q <= pc_q;
                                 sign_a_q <= pc_q(31);
                             else
                                 sign_a_q <= a_q(31);
@@ -364,21 +475,28 @@ begin
                             if alu_use_register_b = '1' then
                                 sign_b_q <= b_q(31);
                             else
-                                result_q <= immediate;
-                                sign_b_q <= immediate(31);
+                                sign_b_q <= instruction_q(31);
                             end if;
                         end if;
-                        state_q <= serial_run;
-                    elsif state_q = serial_run then
-                        if pass_q = increment_pc then
-                            next_pc_q <= alu_result & next_pc_q(31 downto 1);
+                        if pass_q /= increment_pc and alu_use_register_b = '0' then
+                            state_q <= immediate_seed;
                         else
-                            a_q <= a_q(0) & a_q(31 downto 1);
-                            if alu_use_register_b = '1' then
-                                b_q <= b_q(0) & b_q(31 downto 1);
-                            end if;
-                            result_q <= alu_result & result_q(31 downto 1);
+                            state_q <= serial_run;
                         end if;
+                    elsif state_q = immediate_seed then
+                        if bit_q = 31 then
+                            bit_q <= (others => '0');
+                            state_q <= serial_run;
+                        else
+                            bit_q <= bit_q + 1;
+                        end if;
+                    elsif state_q = result_seed then
+                        if bit_q = 31 then
+                            state_q <= write_request;
+                        else
+                            bit_q <= bit_q + 1;
+                        end if;
+                    elsif state_q = serial_run then
                         if bit_q = 31 then
                             state_q <= serial_finish;
                         else
@@ -401,7 +519,6 @@ begin
                             elsif is_jump = '1' then
                                 -- Only JALR changes bit zero; all other bits
                                 -- already contain the destination.
-                                result_q(0) <= target(0);
                                 state_q <= write_request;
                             else
                                 bit_q <= (others => '0');
@@ -411,24 +528,32 @@ begin
                             state_q <= memory_prepare;
                         else
                             if is_compare = '1' then
-                                result_q <= extension_31_type'(others => '0') & comparison;
+                                load_fill_q <= comparison;
+                                bit_q <= (others => '0');
+                                state_q <= result_seed;
+                            else
+                                state_q <= write_request;
                             end if;
-                            state_q <= write_request;
                         end if;
                     elsif state_q = dispatch then
                         if opcode = "0110111" then
-                            result_q <= immediate;
-                            state_q <= write_request;
+                            bit_q <= (others => '0');
+                            state_q <= result_seed;
                         elsif opcode = "0001111" then
                             state_q <= commit;
                         elsif is_shift = '1' then
-                            result_q <= a_q;
+                            bit_q <= (others => '0');
+                            if funct3 = "101" and instruction_q(30) = '1' then
+                                load_fill_q <= a_q(31);
+                            else
+                                load_fill_q <= '0';
+                            end if;
                             if is_immediate = '1' then
                                 shift_q <= unsigned(instruction_q(24 downto 20));
                             else
                                 shift_q <= unsigned(b_q(4 downto 0));
                             end if;
-                            state_q <= shift_run;
+                            state_q <= shift_discard;
                         else
                             if is_branch = '1' then
                                 pass_q <= branch_compare;
@@ -441,37 +566,40 @@ begin
                             end if;
                             state_q <= serial_clear;
                         end if;
-                    elsif state_q = shift_run then
-                        if shift_q = 0 then
-                            state_q <= write_request;
+                    elsif state_q = shift_discard then
+                        -- Right shifts discard low bits first. Left shifts
+                        -- emit leading zero bits instead, without shifting A.
+                        if funct3 = "001" or shift_q = 0 then
+                            state_q <= shift_run;
                         else
                             shift_q <= shift_q - 1;
-                            if funct3 = "001" then
-                                result_q <= result_q(30 downto 0) & '0';
-                            elsif instruction_q(30) = '1' then
-                                result_q <= result_q(31) & result_q(31 downto 1);
-                            else
-                                result_q <= '0' & result_q(31 downto 1);
-                            end if;
+                        end if;
+                    elsif state_q = shift_run then
+                        if shift_padding = '1' then
+                            shift_q <= shift_q - 1;
+                        end if;
+                        if bit_q = 31 then
+                            state_q <= write_request;
+                        else
+                            bit_q <= bit_q + 1;
                         end if;
                     elsif state_q = memory_prepare then
                         if misaligned = '1' then
                             fault_q <= '1';
                             state_q <= halted;
                         else
-                            align_q <= unsigned(result_q(1 downto 0));
                             if is_store = '1' then
+                                shift_q <= to_unsigned(0, 5) - unsigned(result_q(1 downto 0) & "000");
                                 state_q <= store_align;
                             else
                                 state_q <= memory_request;
                             end if;
                         end if;
                     elsif state_q = store_align then
-                        if align_q = 0 then
+                        if shift_q = 0 then
                             state_q <= memory_request;
                         else
-                            b_q <= b_q(23 downto 0) & b_q(31 downto 24);
-                            align_q <= align_q - 1;
+                            shift_q <= shift_q - 1;
                         end if;
                     elsif state_q = memory_request then
                         if bus_ready = '1' then
@@ -483,25 +611,21 @@ begin
                                 fault_q <= '1';
                                 state_q <= halted;
                             elsif is_load = '1' then
-                                a_q <= bus_output;
-                                align_q <= unsigned(result_q(1 downto 0));
+                                shift_q <= unsigned(result_q(1 downto 0) & "000");
                                 state_q <= load_align;
                             else
                                 state_q <= commit;
                             end if;
                         end if;
                     elsif state_q = load_align then
-                        if align_q = 0 then
+                        if shift_q = 0 then
                             bit_q <= (others => '0');
                             load_fill_q <= '0';
                             state_q <= load_run;
                         else
-                            a_q <= x"00" & a_q(31 downto 8);
-                            align_q <= align_q - 1;
+                            shift_q <= shift_q - 1;
                         end if;
                     elsif state_q = load_run then
-                        result_q <= load_bit & result_q(31 downto 1);
-                        a_q <= '0' & a_q(31 downto 1);
                         if (funct3 = "000" and bit_q = 7) or
                            (funct3 = "001" and bit_q = 15) then
                             load_fill_q <= a_q(0);
@@ -516,13 +640,6 @@ begin
                             state_q <= write_wait;
                         end if;
                     elsif state_q = write_wait then
-                        if rf_bit_ready = '1' then
-                            if is_jump = '1' then
-                                next_pc_q <= next_pc_q(0) & next_pc_q(31 downto 1);
-                            else
-                                result_q <= result_q(0) & result_q(31 downto 1);
-                            end if;
-                        end if;
                         if rf_done = '1' then
                             if is_jump = '1' then
                                 bit_q <= (others => '0');
@@ -535,8 +652,6 @@ begin
                         -- The link has already been written. Reuse the next-PC
                         -- shifter for the branch/jump destination, then commit
                         -- PC and its debug snapshot atomically.
-                        next_pc_q <= result_q(0) & next_pc_q(31 downto 1);
-                        result_q <= result_q(0) & result_q(31 downto 1);
                         if bit_q = 31 then
                             state_q <= commit;
                         else
@@ -547,9 +662,6 @@ begin
                         pc_q <= next_pc_q;
                         state_q <= fetch_request;
                     elsif state_q = halted then
-                        if debug_wait_q = '1' and rf_bit_valid = '1' then
-                            a_q <= rf_output & a_q(31 downto 1);
-                        end if;
                         if debug_ready = '1' and debug_request_i = '1' then
                             debug_wait_q <= '1';
                         elsif rf_done = '1' and debug_wait_q = '1' then

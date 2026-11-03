@@ -22,7 +22,7 @@ architecture rtl of elans_register_ram is
     type ram_type is array (0 to depth - 1) of std_logic_vector(data_width - 1 downto 0);
     signal ram : ram_type;
     attribute ramstyle : string;
-    attribute ramstyle of ram : signal is "M9K";
+    attribute ramstyle of ram : signal is "M9K, no_rw_check";
 begin
     ram_pr: process (clock_i) is
     begin
@@ -30,9 +30,11 @@ begin
             if enable_i = '1' then
                 if write_i = '1' then
                     ram(to_integer(unsigned(address_i))) <= data_i;
+                else
+                    -- The RF never consumes data_o during a write. Do not
+                    -- require old-data emulation or a read/write bypass.
+                    data_o <= ram(to_integer(unsigned(address_i)));
                 end if;
-
-                data_o <= ram(to_integer(unsigned(address_i)));
             end if;
         end if;
     end process;
