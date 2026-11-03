@@ -44,18 +44,24 @@ begin
     ram_write <= write_q;
     ram_bit_data(0) <= word_q(to_integer(bit_q));
     bits_gen: if organization = "a" generate
+        signal ram_address : std_logic_vector(12 downto 0);
+    begin
+        ram_address <= "000" & index_q & std_logic_vector(bit_q);
         ram_inst: entity work.elans_register_ram
-            generic map (depth => 1024, address_width => 10, data_width => 1)
+            generic map (depth => 8192, address_width => 13, data_width => 1)
             port map (clock_i => clock_i, enable_i => ram_enable, write_i => ram_write,
-                      address_i => index_q & std_logic_vector(bit_q), data_i => ram_bit_data,
+                      address_i => ram_address, data_i => ram_bit_data,
                       data_o => ram_result(0 downto 0));
         ram_result(31 downto 1) <= (others => '0');
     end generate;
     words_gen: if organization = "b" generate
+        signal ram_address : std_logic_vector(7 downto 0);
+    begin
+        ram_address <= "000" & index_q;
         ram_inst: entity work.elans_register_ram
-            generic map (depth => 32, address_width => 5, data_width => 32)
+            generic map (depth => 256, address_width => 8, data_width => 32)
             port map (clock_i => clock_i, enable_i => ram_enable, write_i => ram_write,
-                      address_i => index_q, data_i => word_q,
+                      address_i => ram_address, data_i => word_q,
                       data_o => ram_result);
     end generate;
     rf_pr: process (clock_i, async_reset_i) is

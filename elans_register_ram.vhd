@@ -21,6 +21,8 @@ end entity;
 architecture rtl of elans_register_ram is
     type ram_type is array (0 to depth - 1) of std_logic_vector(data_width - 1 downto 0);
     signal ram : ram_type;
+    attribute ramstyle : string;
+    attribute ramstyle of ram : signal is "M9K";
 begin
     ram_pr: process (clock_i) is
     begin
@@ -28,10 +30,9 @@ begin
             if enable_i = '1' then
                 if write_i = '1' then
                     ram(to_integer(unsigned(address_i))) <= data_i;
-                    data_o <= data_i;
-                else
-                    data_o <= ram(to_integer(unsigned(address_i)));
                 end if;
+
+                data_o <= ram(to_integer(unsigned(address_i)));
             end if;
         end if;
     end process;
