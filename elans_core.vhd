@@ -79,24 +79,49 @@ architecture rtl of elans_core is
     signal is_jump : std_logic;
     signal is_shift : std_logic;
     signal is_compare : std_logic;
-    type immediate_format_type is (format_i, format_s, format_b, format_u, format_j);
-    signal immediate_format_q : immediate_format_type;
-    signal immediate_word : std_logic_vector(31 downto 0);
+    subtype instruction_bit_index_type is std_logic_vector(4 downto 0);
+    type immediate_index_table_type is array (0 to 31) of instruction_bit_index_type;
+    constant immediate_i_indices : immediate_index_table_type := (
+        "10100", "10101", "10110", "10111", "11000", "11001", "11010", "11011",
+        "11100", "11101", "11110", "11111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
+    );
+    constant immediate_s_indices : immediate_index_table_type := (
+        "00111", "01000", "01001", "01010", "01011", "11001", "11010", "11011",
+        "11100", "11101", "11110", "11111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
+    );
+    constant immediate_b_indices : immediate_index_table_type := (
+        "11111", "01000", "01001", "01010", "01011", "11001", "11010", "11011",
+        "11100", "11101", "11110", "00111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
+    );
+    constant immediate_j_indices : immediate_index_table_type := (
+        "11111", "10101", "10110", "10111", "11000", "11001", "11010", "11011",
+        "11100", "11101", "11110", "10100", "01100", "01101", "01110", "01111",
+        "10000", "10001", "10010", "10011", "11111", "11111", "11111", "11111",
+        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
+    );
+    signal immediate_index : instruction_bit_index_type;
+    signal immediate_zero : std_logic;
     signal immediate_bit : std_logic;
     signal pc_serial_bit : std_logic;
     signal is_lui : std_logic;
     signal is_auipc : std_logic;
     signal is_jalr : std_logic;
     signal is_fence : std_logic;
-    signal execute_operation_q : std_logic_vector(2 downto 0);
-    signal execute_subtract_q : std_logic;
-    signal branch_mode_q : std_logic_vector(1 downto 0);
+    signal execute_operation : std_logic_vector(2 downto 0);
+    signal execute_subtract : std_logic;
+    signal branch_mode : std_logic_vector(1 downto 0);
     signal branch_base : std_logic;
-    signal compare_signed_q : std_logic;
-    signal memory_size_q : std_logic_vector(1 downto 0);
-    signal memory_signed_q : std_logic;
-    signal shift_right_q : std_logic;
-    signal shift_arithmetic_q : std_logic;
+    signal compare_signed : std_logic;
+    signal memory_size : std_logic_vector(1 downto 0);
+    signal memory_signed : std_logic;
+    signal shift_right : std_logic;
+    signal shift_arithmetic : std_logic;
     signal alu_a_bit : std_logic;
     signal alu_b_bit : std_logic;
     signal alu_use_pc : std_logic;
@@ -154,6 +179,32 @@ begin
     opcode <= instruction_q(6 downto 0);
     funct3 <= instruction_q(14 downto 12);
     funct7 <= instruction_q(31 downto 25);
+    -- instruction_q is the sole storage for instruction controls. These
+    -- shared decodes stay stable for all execution passes and pending AXI.
+    is_register <= '1' when opcode = "0110011" else '0';
+    is_immediate <= '1' when opcode = "0010011" else '0';
+    is_load <= '1' when opcode = "0000011" else '0';
+    is_store <= '1' when opcode = "0100011" else '0';
+    is_branch <= '1' when opcode = "1100011" else '0';
+    is_jump <= '1' when opcode = "1101111" or opcode = "1100111" else '0';
+    is_lui <= '1' when opcode = "0110111" else '0';
+    is_auipc <= '1' when opcode = "0010111" else '0';
+    is_jalr <= '1' when opcode = "1100111" else '0';
+    is_fence <= '1' when opcode = "0001111" else '0';
+    is_shift <= '1' when (is_register = '1' or is_immediate = '1') and
+        funct3(1 downto 0) = "01" else '0';
+    is_compare <= '1' when (is_register = '1' or is_immediate = '1') and
+        funct3(2 downto 1) = "01" else '0';
+    execute_operation <= funct3 when
+        (is_register = '1' or is_immediate = '1') and is_compare = '0' else "000";
+    execute_subtract <= '1' when is_compare = '1' or
+        (is_register = '1' and funct3 = "000" and funct7 = "0100000") else '0';
+    branch_mode <= instruction_q(14 downto 13);
+    compare_signed <= not instruction_q(12);
+    memory_size <= instruction_q(13 downto 12);
+    memory_signed <= not instruction_q(14);
+    shift_right <= instruction_q(14);
+    shift_arithmetic <= instruction_q(14) and instruction_q(30);
     legal <= '1' when
         (is_register = '1' and (funct7 = "0000000" or
             (funct7 = "0100000" and (funct3 = "000" or funct3 = "101")))) or
@@ -167,21 +218,19 @@ begin
         (opcode = "1100111" and funct3 = "000") or
         (opcode = "0001111" and funct3 = "000" and instruction_q(31 downto 28) = "0000")
         else '0';
-    -- All immediate formats are fixed wiring followed by one common
-    -- bit selector: no variable additions on instruction indices.
-    with immediate_format_q select immediate_word <=
-        std_logic_vector'(31 downto 12 => instruction_q(31)) &
-            instruction_q(31 downto 25) & instruction_q(11 downto 7) when format_s,
-        std_logic_vector'(31 downto 13 => instruction_q(31)) &
-            instruction_q(31) & instruction_q(7) & instruction_q(30 downto 25) &
-            instruction_q(11 downto 8) & '0' when format_b,
-        instruction_q(31 downto 12) & x"000" when format_u,
-        std_logic_vector'(31 downto 21 => instruction_q(31)) &
-            instruction_q(31) & instruction_q(19 downto 12) & instruction_q(20) &
-            instruction_q(30 downto 21) & '0' when format_j,
-        std_logic_vector'(31 downto 12 => instruction_q(31)) &
-            instruction_q(31 downto 20) when others;
-    immediate_bit <= immediate_word(to_integer(bit_q));
+    -- Select a 5-bit source index before reading instruction_q. This
+    -- avoids a format multiplexer spread over a 32-bit immediate word.
+    -- Sign extension maps to bit 31; only format-specific zeros need masking.
+    immediate_index <= std_logic_vector(bit_q) when is_lui = '1' or is_auipc = '1' else
+        immediate_j_indices(to_integer(bit_q)) when opcode = "1101111" else
+        immediate_b_indices(to_integer(bit_q)) when is_branch = '1' else
+        immediate_s_indices(to_integer(bit_q)) when is_store = '1' else
+        immediate_i_indices(to_integer(bit_q));
+    immediate_zero <= '1' when
+        ((is_lui = '1' or is_auipc = '1') and bit_q < 12) or
+        ((is_branch = '1' or opcode = "1101111") and bit_q = 0) else '0';
+    immediate_bit <= '0' when immediate_zero = '1' else
+        instruction_q(to_integer(unsigned(immediate_index)));
     -- One PC bit selector serves both serial PC copies; the architectural
     -- PC itself remains stable until commit.
     pc_serial_bit <= pc_q(to_integer(bit_q));
@@ -194,19 +243,19 @@ begin
     alu_b_bit <= '1' when pass_q = increment_pc and bit_q = 2 else
                  '0' when pass_q = increment_pc else
                  b_q(0) when alu_use_register_b = '1' else result_q(0);
-    alu_operation <= execute_operation_q when pass_q = execute_value else "000";
+    alu_operation <= execute_operation when pass_q = execute_value else "000";
     alu_subtract <= '1' when pass_q = branch_compare else
-                    execute_subtract_q when pass_q = execute_value else '0';
+                    execute_subtract when pass_q = execute_value else '0';
     alu_clear <= '1' when state_q = serial_clear else '0';
     alu_step <= '1' when state_q = serial_run and fault_i = '0' else '0';
     signed_less <= sign_a_q when sign_a_q /= sign_b_q else alu_less;
-    comparison <= signed_less when compare_signed_q = '1' else alu_less;
-    branch_base <= alu_equal when branch_mode_q = "00" else
-                   signed_less when branch_mode_q = "10" else alu_less;
+    comparison <= signed_less when compare_signed = '1' else alu_less;
+    branch_base <= alu_equal when branch_mode = "00" else
+                   signed_less when branch_mode = "10" else alu_less;
     branch_taken <= branch_base xor instruction_q(12);
     target <= result_q(31 downto 1) & '0' when is_jalr = '1' else result_q;
-    misaligned <= '1' when (memory_size_q = "01" and result_q(0) = '1') or
-                          (memory_size_q = "10" and result_q(1 downto 0) /= "00") else '0';
+    misaligned <= '1' when (memory_size = "01" and result_q(0) = '1') or
+                          (memory_size = "10" and result_q(1 downto 0) /= "00") else '0';
     fault_o <= fault_q or fault_i;
     pc_o <= pc_q;
     previous_pc_o <= previous_pc_q;
@@ -230,17 +279,17 @@ begin
     -- Selection is latched on request acceptance, not inferred from the
     -- current FSM state: even a fault must not change a pending AXI address.
     bus_address <= pc_q when bus_fetch_q = '1' else result_q(31 downto 2) & "00";
-    bus_strobe <= "1111" when memory_size_q = "10" else
-        "0011" when memory_size_q = "01" and result_q(1) = '0' else
-        "1100" when memory_size_q = "01" else
+    bus_strobe <= "1111" when memory_size = "10" else
+        "0011" when memory_size = "01" and result_q(1) = '0' else
+        "1100" when memory_size = "01" else
         "0001" when result_q(1 downto 0) = "00" else
         "0010" when result_q(1 downto 0) = "01" else
         "0100" when result_q(1 downto 0) = "10" else "1000";
     -- Inactive store lanes are ignored by WSTRB. Rotate right by
     -- (-8 * byte_offset) mod 32 single-bit steps before issuing AXI.
     bus_input <= b_q;
-    load_bit <= a_q(0) when memory_size_q = "10" or bit_q < 8 or
-        (memory_size_q = "01" and bit_q < 16) else load_fill_q;
+    load_bit <= a_q(0) when memory_size = "10" or bit_q < 8 or
+        (memory_size = "01" and bit_q < 16) else load_fill_q;
     alu_inst: entity work.elans_alu
         generic map (use_async_reset => use_async_reset, use_sync_reset => use_sync_reset,
             async_reset_active => async_reset_active, sync_reset_active => sync_reset_active)
@@ -286,7 +335,7 @@ begin
     -- One shift enable and one serial input per temporary. All serial
     -- operations share the same fixed right-shift wiring, including SLL.
     datapath_active <= '0' when fault_i = '1' and state_q /= halted else '1';
-    shift_padding <= '1' when shift_right_q = '0' and shift_q /= 0 else '0';
+    shift_padding <= '1' when shift_right = '0' and shift_q /= 0 else '0';
     a_load_bus <= '1' when state_q = memory_wait and bus_done = '1' and
         bus_error = '0' and is_load = '1' else '0';
     a_shift <= '1' when
@@ -295,7 +344,7 @@ begin
         (state_q = pc_seed and pass_q /= increment_pc) or
         (state_q = serial_run and pass_q /= increment_pc) or
         (state_q = load_align and shift_q /= 0) or state_q = load_run or
-        (state_q = shift_discard and shift_right_q = '1' and shift_q /= 0) or
+        (state_q = shift_discard and shift_right = '1' and shift_q /= 0) or
         (state_q = shift_run and shift_padding = '0') else '0';
     a_in <= rf_output when state_q = read_a_wait or state_q = halted else
             pc_serial_bit when state_q = pc_seed else
@@ -377,98 +426,6 @@ begin
                 else
                     bus_fetch_q <= '0';
                 end if;
-            end if;
-        end if;
-    end process;
-
-    predecode_pr: process (clock_i, async_reset_i) is
-        procedure reset_decode is
-        begin
-            is_register <= '0';
-            is_immediate <= '0';
-            is_load <= '0';
-            is_store <= '0';
-            is_branch <= '0';
-            is_jump <= '0';
-            is_shift <= '0';
-            is_compare <= '0';
-            is_lui <= '0';
-            is_auipc <= '0';
-            is_jalr <= '0';
-            is_fence <= '0';
-            execute_operation_q <= "000";
-            execute_subtract_q <= '0';
-            branch_mode_q <= "00";
-            compare_signed_q <= '0';
-            memory_size_q <= "00";
-            memory_signed_q <= '0';
-            shift_right_q <= '0';
-            shift_arithmetic_q <= '0';
-            immediate_format_q <= format_i;
-        end procedure;
-    begin
-        if (async_reset_i = async_reset_active) and use_async_reset then
-            reset_decode;
-        elsif rising_edge(clock_i) then
-            if (sync_reset_i = sync_reset_active) and use_sync_reset then
-                reset_decode;
-            elsif state_q = fetch_wait and bus_done = '1' and
-                  bus_error = '0' and fault_i = '0' then
-                reset_decode;
-                branch_mode_q <= bus_output(14 downto 13);
-                compare_signed_q <= not bus_output(12);
-                memory_size_q <= bus_output(13 downto 12);
-                memory_signed_q <= not bus_output(14);
-                shift_right_q <= bus_output(14);
-                shift_arithmetic_q <= bus_output(14) and bus_output(30);
-                case bus_output(6 downto 0) is
-                    when "0110011" | "0010011" =>
-                        if bus_output(6 downto 0) = "0110011" then
-                            is_register <= '1';
-                        else
-                            is_immediate <= '1';
-                        end if;
-                        if bus_output(14 downto 12) = "001" or
-                           bus_output(14 downto 12) = "101" then
-                            is_shift <= '1';
-                        end if;
-                        if bus_output(14 downto 12) = "010" or
-                           bus_output(14 downto 12) = "011" then
-                            is_compare <= '1';
-                            execute_subtract_q <= '1';
-                        else
-                            execute_operation_q <= bus_output(14 downto 12);
-                            if bus_output(6 downto 0) = "0110011" and
-                               bus_output(14 downto 12) = "000" and
-                               bus_output(31 downto 25) = "0100000" then
-                                execute_subtract_q <= '1';
-                            end if;
-                        end if;
-                    when "0000011" =>
-                        is_load <= '1';
-                    when "0100011" =>
-                        is_store <= '1';
-                        immediate_format_q <= format_s;
-                    when "1100011" =>
-                        is_branch <= '1';
-                        immediate_format_q <= format_b;
-                    when "1101111" =>
-                        is_jump <= '1';
-                        immediate_format_q <= format_j;
-                    when "1100111" =>
-                        is_jump <= '1';
-                        is_jalr <= '1';
-                    when "0110111" =>
-                        is_lui <= '1';
-                        immediate_format_q <= format_u;
-                    when "0010111" =>
-                        is_auipc <= '1';
-                        immediate_format_q <= format_u;
-                    when "0001111" =>
-                        is_fence <= '1';
-                    when others =>
-                        null;
-                end case;
             end if;
         end if;
     end process;
@@ -640,7 +597,7 @@ begin
                             state_q <= commit;
                         elsif is_shift = '1' then
                             bit_q <= (others => '0');
-                            if shift_arithmetic_q = '1' then
+                            if shift_arithmetic = '1' then
                                 load_fill_q <= a_q(31);
                             else
                                 load_fill_q <= '0';
@@ -666,7 +623,7 @@ begin
                     elsif state_q = shift_discard then
                         -- Right shifts discard low bits first. Left shifts
                         -- emit leading zero bits instead, without shifting A.
-                        if shift_right_q = '0' or shift_q = 0 then
+                        if shift_right = '0' or shift_q = 0 then
                             state_q <= shift_run;
                         else
                             shift_q <= shift_q - 1;
@@ -686,7 +643,7 @@ begin
                             state_q <= halted;
                         else
                             if is_store = '1' then
-                                shift_q <= to_unsigned(0, 5) - unsigned(result_q(1 downto 0) & "000");
+                                shift_q <= to_unsigned(0, 5) - unsigned(std_logic_vector'(result_q(1 downto 0) & "000"));
                                 state_q <= store_align;
                             else
                                 state_q <= memory_request;
@@ -708,7 +665,7 @@ begin
                                 fault_q <= '1';
                                 state_q <= halted;
                             elsif is_load = '1' then
-                                shift_q <= unsigned(result_q(1 downto 0) & "000");
+                                shift_q <= unsigned(std_logic_vector'(result_q(1 downto 0) & "000"));
                                 state_q <= load_align;
                             else
                                 state_q <= commit;
@@ -723,9 +680,9 @@ begin
                             shift_q <= shift_q - 1;
                         end if;
                     elsif state_q = load_run then
-                        if memory_signed_q = '1' and
-                           ((memory_size_q = "00" and bit_q = 7) or
-                            (memory_size_q = "01" and bit_q = 15)) then
+                        if memory_signed = '1' and
+                           ((memory_size = "00" and bit_q = 7) or
+                            (memory_size = "01" and bit_q = 15)) then
                             load_fill_q <= a_q(0);
                         end if;
                         if bit_q = 31 then
