@@ -80,34 +80,6 @@ architecture rtl of elans_core is
     signal is_jump : std_logic;
     signal is_shift : std_logic;
     signal is_compare : std_logic;
-    subtype instruction_bit_index_type is std_logic_vector(4 downto 0);
-    type immediate_index_table_type is array (0 to 31) of instruction_bit_index_type;
-    constant immediate_i_indices : immediate_index_table_type := (
-        "10100", "10101", "10110", "10111", "11000", "11001", "11010", "11011",
-        "11100", "11101", "11110", "11111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
-    );
-    constant immediate_s_indices : immediate_index_table_type := (
-        "00111", "01000", "01001", "01010", "01011", "11001", "11010", "11011",
-        "11100", "11101", "11110", "11111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
-    );
-    constant immediate_b_indices : immediate_index_table_type := (
-        "11111", "01000", "01001", "01010", "01011", "11001", "11010", "11011",
-        "11100", "11101", "11110", "00111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
-    );
-    constant immediate_j_indices : immediate_index_table_type := (
-        "11111", "10101", "10110", "10111", "11000", "11001", "11010", "11011",
-        "11100", "11101", "11110", "10100", "01100", "01101", "01110", "01111",
-        "10000", "10001", "10010", "10011", "11111", "11111", "11111", "11111",
-        "11111", "11111", "11111", "11111", "11111", "11111", "11111", "11111"
-    );
-    signal immediate_index : instruction_bit_index_type;
-    signal immediate_zero : std_logic;
     signal immediate_bit : std_logic;
     signal pc_serial_bit : std_logic;
     signal is_lui : std_logic;
@@ -217,19 +189,17 @@ begin
         (opcode = "1100111" and funct3 = "000") or
         (opcode = "0001111" and funct3 = "000" and instruction_q(31 downto 28) = "0000")
         else '0';
-    -- Select a 5-bit source index before reading instruction_q. This
-    -- avoids a format multiplexer spread over a 32-bit immediate word.
-    -- Sign extension maps to bit 31; only format-specific zeros need masking.
-    immediate_index <= std_logic_vector(bit_q) when is_lui = '1' or is_auipc = '1' else
-        immediate_j_indices(to_integer(bit_q)) when opcode = "1101111" else
-        immediate_b_indices(to_integer(bit_q)) when is_branch = '1' else
-        immediate_s_indices(to_integer(bit_q)) when is_store = '1' else
-        immediate_i_indices(to_integer(bit_q));
-    immediate_zero <= '1' when
-        ((is_lui = '1' or is_auipc = '1') and bit_q < 12) or
-        ((is_branch = '1' or opcode = "1101111") and bit_q = 0) else '0';
-    immediate_bit <= '0' when immediate_zero = '1' else
-        instruction_q(to_integer(unsigned(immediate_index)));
+    inter_inst: entity work.elans_inter
+        port map (
+            instruction_i => instruction_q,
+            bit_i => bit_q,
+            opcode_i => opcode,
+            is_lui_i => is_lui,
+            is_auipc_i => is_auipc,
+            is_branch_i => is_branch,
+            is_store_i => is_store,
+            immediate_bit_o => immediate_bit
+        );
     -- One PC bit selector serves both serial PC copies; the architectural
     -- PC itself remains stable until commit.
     pc_serial_bit <= pc_q(to_integer(bit_q));
